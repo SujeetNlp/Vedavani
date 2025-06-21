@@ -1,15 +1,11 @@
 # ------------------ Imports ------------------
 import os
 import torch
-import librosa
 import pandas as pd
 import argparse
 import logging
 from tqdm import tqdm
-from dataclasses import dataclass
-from typing import List, Dict, Union, Optional
 from datasets import Dataset, load_metric
-from torch.utils.data import DataLoader
 from transformers import (
     Wav2Vec2CTCTokenizer,
     Wav2Vec2FeatureExtractor,
@@ -19,61 +15,13 @@ from transformers import (
 )
 from pyctcdecode import build_ctcdecoder
 
+from utils import speech_file_to_array_fn, prepare_dataset, DataCollatorCTCWithPadding
+from metrics import compute_metrics
+from config import Config
+
 # ------------------ Logging ------------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# ------------------ Functions ------------------
-def speech_file_to_array_fn(batch):
-    speech_array, sampling_rate = librosa.load(batch["path"], sr=16000)
-    batch["speech"] = speech_array
-    batch["sampling_rate"] = sampling_rate
-    batch["target_text"] = batch["text"]
-    return batch
-
-def prepare_dataset(batch, processor):
-    batch["input_values"] = processor(batch["speech"], sampling_rate=batch["sampling_rate"][0]).input_values
-    with processor.as_target_processor():
-        batch["labels"] = processor(batch["target_text"]).input_ids
-    return batch
-
-@dataclass
-class DataCollatorCTCWithPadding:
-    processor: Union[Wav2Vec2Processor, Wav2Vec2ProcessorWithLM]
-    padding: Union[bool, str] = True
-    max_length_labels: Optional[int] = None
-    pad_to_multiple_of: Optional[int] = None
-    pad_to_multiple_of_labels: Optional[int] = None
-
-    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        input_features = [{"input_values": feature["input_values"]} for feature in features]
-        label_features = [{"input_ids": feature["labels"]} for feature in features]
-
-        batch = self.processor.pad(input_features, padding=self.padding,
-                                   pad_to_multiple_of=self.pad_to_multiple_of, return_tensors="pt")
-        with self.processor.as_target_processor():
-            labels_batch = self.processor.pad(label_features, padding=self.padding,
-                                              max_length=self.max_length_labels,
-                                              pad_to_multiple_of=self.pad_to_multiple_of_labels,
-                                              return_tensors="pt")
-        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
-        batch["labels"] = labels
-        return batch
-
-def compute_metrics(outputs, labels, processor, wer_metric, cer_metric, results_df, use_lm):
-    logits = outputs.logits
-    if use_lm:
-        pred_str = processor.batch_decode(logits.cpu().numpy()).text
-    else:
-        pred_ids = torch.argmax(logits, dim=-1)
-        pred_str = processor.batch_decode(pred_ids)
-    labels[labels == -100] = processor.tokenizer.pad_token_id
-    label_str = processor.tokenizer.batch_decode(labels, group_tokens=False)
-    wer = wer_metric.compute(predictions=pred_str, references=label_str)
-    cer = cer_metric.compute(predictions=pred_str, references=label_str)
-    batch_results_df = pd.DataFrame({"Original String": label_str, "Predicted String": pred_str, "WER": wer, "CER": cer})
-    results_df = pd.concat([results_df, batch_results_df], ignore_index=True)
-    return wer, cer, results_df
 
 # ------------------ Main Function ------------------
 def main(args):
@@ -81,13 +29,13 @@ def main(args):
     logger.info(f"Using device: {device}")
 
     df_test = pd.read_csv(args.csv_path)
-    df_test = df_test[df_test['length'] < 30]
+    df_test = df_test[df_test['length'] < Config.max_audio_length]
     df_test['path'] = args.audio_path_prefix + df_test['audio_file']
     test_data = Dataset.from_pandas(df_test)
 
     tokenizer = Wav2Vec2CTCTokenizer(args.vocab_path, unk_token="[UNK]", pad_token="[PAD]", word_delimiter_token="|")
     feature_extractor = Wav2Vec2FeatureExtractor(
-        feature_size=1, sampling_rate=16000, padding_value=0.0, do_normalize=True, return_attention_mask=True
+        feature_size=1, sampling_rate=Config.sampling_rate, padding_value=0.0, do_normalize=True, return_attention_mask=True
     )
 
     if args.arpa_path:
@@ -101,13 +49,13 @@ def main(args):
         use_lm = False
 
     test_data = test_data.map(speech_file_to_array_fn, remove_columns=test_data.column_names)
-    test_dataset = test_data.map(lambda x: prepare_dataset(x, processor), remove_columns=test_data.column_names, batch_size=32, batched=True)
+    test_dataset = test_data.map(lambda x: prepare_dataset(x, processor), remove_columns=test_data.column_names, batch_size=args.batch_size, batched=True)
 
     data_collator = DataCollatorCTCWithPadding(processor=processor, padding=True)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, collate_fn=data_collator)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, collate_fn=data_collator)
 
-    wer_metric = load_metric("wer")
-    cer_metric = load_metric("cer")
+    wer_metric = load_metric("wer", trust_remote_code=True)
+    cer_metric = load_metric("cer", trust_remote_code=True)
     results_df = pd.DataFrame(columns=["Original String", "Predicted String", "WER", "CER"])
 
     logger.info("Loading model...")
@@ -136,7 +84,6 @@ def main(args):
     results_df = pd.concat([results_df, summary_row], ignore_index=True)
     results_df.to_csv(args.save_path, index=False)
     logger.info(f"Saved results to {args.save_path}")
-
 
 
 if __name__ == '__main__':
