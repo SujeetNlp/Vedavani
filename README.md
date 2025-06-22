@@ -25,3 +25,39 @@ Install dependencies listed in requirements.txt:
 ```bash
 pip install -r requirements.txt
 ```
+
+## Usage
+
+### Encoder-Only Models
+Move to "Encoder_Only" directory
+
+#### Train Encoder-Only Model 
+
+Make sure you're logged into Hugging Face before training:
+
+```bash
+huggingface-cli login
+    # Training the model using the provided dataset and pretrained checkpoint
+python train.py \
+  --train_csv /path/to/train.csv \
+  --val_csv /path/to/validation.csv \
+  --audio_path_prefix /path/to/Audio_files/ \
+  --vocab_path /path/to/vocab.json \
+  --output_dir /path/to/output_dir \
+  --pretrained_model facebook/wav2vec2-base \
+  --train_batch_size 8 \
+  --eval_batch_size 8
+```
+
+#### Evaluate the Encoder-Only Model
+```bash
+python evaluate.py \
+  --csv_path /path/to/test.csv \
+  --audio_path_prefix /path/to/Audio_files/ \
+  --vocab_path /path/to/vocab.json \
+  --model_dir /path/to/checkpoints/epoch_20 \
+  --save_path /path/to/inference/resuts.csv \
+  --batch_size 32
+
+```
+
