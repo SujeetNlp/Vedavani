@@ -7,3 +7,9 @@ Code and dataset for the ACL 2025 paper ["Vedavani: A Benchmark Corpus for ASR o
 Sujeet Kumar, Pretam Ray, Abhinay Beerukuri, Shrey Kamoji, Manoj Balaji Jagadeeshan, and Pawan Goyal.
 
 Vedavani introduces a 54‑hour annotated speech corpus from the Rig Veda (≈20 k verses) and Atharva Veda (≈10 k verses); this is the first ASR study targeting Vedic Sanskrit poetry, capturing its complex prosody and phonetics. We benchmark multiple SOTA models—including multilingual variants, Whisper, and IndicWhisper—showing strong performance of IndicWhisper 
+
+## Installation
+Install dependencies listed in requirements.txt:
+```bash
+pip install -r requirements.txt
+```
