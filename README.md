@@ -97,3 +97,16 @@ python results.py \
         --original /path/to/test_orig.txt \
         --predicted /path/to/test_predicted.txt
 ```
+
+## How to cite
+
+If you are using code or our Vedavani Dataset, please cite our work as follow :
+
+```
+@article{
+  title={Vedavani: A Benchmark Corpus for ASR on Vedic Sanskrit Poetry},
+  author={Sujeet Kumar, Pretam Ray, Abhinay Beerukuri, Shrey Kamoji, Manoj Balaji Jagadeeshan, and Pawan Goyal},
+  journal={https://arxiv.org/pdf/2506.00145v1},
+  year={2025}
+}
+
