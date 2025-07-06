@@ -1,10 +1,26 @@
-import os
-import torch
+#!/usr/bin/env python3
+"""train.py – fine-tune Whisper on a mapped DatasetDict.
+
+Required CLI arguments:
+    --dataset_dir   Path to the *mapped* DatasetDict saved by preprocess.py
+    --model_path    Base Whisper checkpoint (local dir or HF hub id)
+    --output_dir    Where to write checkpoints / logs / final processor
+
+Example
+    python train.py \
+        --dataset_dir /data/mapped_dataset \
+        --model_path  openai/whisper-medium \
+        --output_dir  /results/whisper_finetuned
+"""
+
 import argparse
-from datasets import load_from_disk
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
 
+import torch
+import evaluate
+from datasets import load_from_disk
 from transformers import (
     WhisperFeatureExtractor,
     WhisperTokenizer,
@@ -14,142 +30,134 @@ from transformers import (
     Seq2SeqTrainer,
 )
 
-import evaluate
+# ――― constants ―――
+MAX_DURATION_SECONDS = 30.0
+SAMPLE_RATE = 16000
+MAX_INPUT_LENGTH = int(MAX_DURATION_SECONDS * SAMPLE_RATE)
+MAX_LABEL_LENGTH = 448
 
-# ------------------------------
-# Data Collator Definition
-# ------------------------------
+
+# ――― helpers ―――
+
+def filter_inputs(input_length: int) -> bool:
+    return 0 < input_length < MAX_INPUT_LENGTH
+
+
+def filter_labels(labels_length: int) -> bool:
+    return labels_length < MAX_LABEL_LENGTH
+
+
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
     processor: Any
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        input_features = [{"input_features": feature["input_features"]} for feature in features]
-        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
+        # audio
+        inputs = [{"input_features": f["input_features"]} for f in features]
+        batch = self.processor.feature_extractor.pad(inputs, return_tensors="pt")
 
-        label_features = [{"input_ids": feature["labels"]} for feature in features]
-        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
-
+        # labels
+        label_feats = [{"input_ids": f["labels"]} for f in features]
+        labels_batch = self.processor.tokenizer.pad(label_feats, return_tensors="pt")
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
-
         if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():
             labels = labels[:, 1:]
-
         batch["labels"] = labels
         return batch
 
-# ------------------------------
-# Metrics Computation
-# ------------------------------
-def compute_metrics(pred, tokenizer):
-    metric_wer = evaluate.load("wer")
-    metric_cer = evaluate.load("cer")
 
+# ――― metric fn ―――
+metric_wer = evaluate.load("wer")
+metric_cer = evaluate.load("cer")
+
+def compute_metrics(pred):
     pred_ids = pred.predictions
     label_ids = pred.label_ids
     label_ids[label_ids == -100] = tokenizer.pad_token_id
-
     pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-
     wer = 100 * metric_wer.compute(predictions=pred_str, references=label_str)
     cer = 100 * metric_cer.compute(predictions=pred_str, references=label_str)
-
     return {"wer": wer, "cer": cer}
 
-# ------------------------------
-# Main Function
-# ------------------------------
-def main(args):
-    # Load dataset
-    dataset = load_from_disk(args.dataset_path)
 
-    # Filter
-    max_input_length = 30.0 * 16000
-    dataset = dataset.filter(lambda x: 0 < x["input_length"] < max_input_length)
-    dataset = dataset.filter(lambda x: x["labels_length"] < 448)
+# ――― main ―――
 
-    # Load processor, tokenizer, model
-    processor = WhisperProcessor.from_pretrained(args.model_path, language="sanskrit", task="transcribe")
-    tokenizer = WhisperTokenizer.from_pretrained(args.model_path, language="sanskrit", task="transcribe")
+def main():
+    parser = argparse.ArgumentParser(description="Fine-tune Whisper")
+    parser.add_argument("--dataset_dir", required=True, help="Path to mapped DatasetDict (output_dir2 from preprocess.py)")
+    parser.add_argument("--model_path", required=True, help="HF model id or local directory for Whisper checkpoint")
+    parser.add_argument("--output_dir", required=True, help="Where to save checkpoints, logs, and the final processor")
+    # optional quick knobs
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--max_steps", type=int, default=1200)
+    parser.add_argument("--eval_steps", type=int, default=300)
+    args = parser.parse_args()
+
+    # ――― load dataset ―――
+    ds = load_from_disk(args.dataset_dir)
+    ds = ds.filter(filter_inputs, input_columns=["input_length"])
+    ds = ds.filter(filter_labels, input_columns=["labels_length"])
+
+    # ――― processor/model ―――
+    global tokenizer  # used in compute_metrics
     feature_extractor = WhisperFeatureExtractor.from_pretrained(args.model_path)
-    model = WhisperForConditionalGeneration.from_pretrained(args.model_path, ignore_mismatched_sizes=True)
+    tokenizer = WhisperTokenizer.from_pretrained(args.model_path, language="sanskrit", task="transcribe")
+    processor = WhisperProcessor.from_pretrained(args.model_path, language="sanskrit", task="transcribe")
 
+    model = WhisperForConditionalGeneration.from_pretrained(args.model_path, ignore_mismatched_sizes=True)
     model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(language="sanskrit", task="transcribe")
     model.config.suppress_tokens = []
     model.generation_config.forced_decoder_ids = model.config.forced_decoder_ids
     model.generation_config.suppress_tokens = []
 
-    # Move model to device
+    # move to GPU if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # Training arguments
+    # ――― training setup ―――
     training_args = Seq2SeqTrainingArguments(
         output_dir=args.output_dir,
-        per_device_train_batch_size=4,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=1,
-        learning_rate=1e-5,
+        learning_rate=args.learning_rate,
         warmup_steps=500,
-        max_steps=15000 * 8,
+        max_steps=args.max_steps,
         gradient_checkpointing=True,
-        fp16=True,
+        fp16=torch.cuda.is_available(),
         evaluation_strategy="steps",
-        per_device_eval_batch_size=4,
         predict_with_generate=True,
         generation_max_length=225,
-        save_steps=10000,
-        eval_steps=10000,
-        logging_steps=25,
+        save_steps=args.eval_steps,
+        eval_steps=args.eval_steps,
+        logging_steps=args.eval_steps // 10,
         report_to=["tensorboard"],
-        save_total_limit=3,
+        save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="wer",
         greater_is_better=False,
         push_to_hub=False,
-        fp16_full_eval=False,
     )
 
-    # Trainer
+    data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
+
     trainer = Seq2SeqTrainer(
         args=training_args,
         model=model,
-        train_dataset=dataset["train"],
-        eval_dataset=dataset["valid"],
-        data_collator=DataCollatorSpeechSeq2SeqWithPadding(processor),
-        compute_metrics=lambda pred: compute_metrics(pred, tokenizer),
-        tokenizer=feature_extractor,
+        train_dataset=ds["train"],
+        eval_dataset=ds["valid"],
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+        tokenizer=processor.feature_extractor,
     )
 
-    processor.save_pretrained(training_args.output_dir)
+    # save processor so it travels with the model
+    processor.save_pretrained(args.output_dir)
 
-    # Train
     trainer.train()
 
-# ------------------------------
-# Argument Parsing
-# ------------------------------
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--dataset_path",
-        type=str,
-        default="/home/sujeet-pg/whisper/saved_data_after_map_devnagri",
-        help="Path to the processed dataset directory",
-    )
-    parser.add_argument(
-        "--model_path",
-        type=str,
-        default="/home/sujeet-pg/whisper/sanskrit_models/whisper-medium-sa_alldata_multigpu",
-        help="Path to the pre-trained Whisper model",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="/home/sujeet-pg/whisper/indicwhisper_devns",
-        help="Directory to save model checkpoints and logs",
-    )
-
-    args = parser.parse_args()
-    main(args)
+    main()
