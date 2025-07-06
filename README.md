@@ -28,6 +28,7 @@ pip install -r requirements.txt
 
 ## Usage
 
+
 ### Encoder-Only Models
 Move to "Encoder_Only" directory
 
@@ -61,3 +62,38 @@ python evaluate.py \
 
 ```
 
+### Encoder-Decoder Models 
+There are four steps involved here
+
+1. Data Preprocessing - Convert raw `.wav` audio to model-ready format.
+```bash
+python preprocess.py \
+  --train_csv /path/to/train.csv \
+  --test_csv /path/to/test.csv \
+  --valid_csv /path/to/validation.csv \
+  --audio_dir /path/to/Audio_files \
+  --output_dir1 /path/to/raw_dataset \
+  --output_dir2 /path/to/mapped_dataset
+```
+
+2. Training - Fine-tune a model (e.g., openai/whisper-small) on the dataset.
+```bash
+python train.py \
+  --dataset_dir /path/to/mapped_dataset \
+  --model_path openai/whisper-small \ ( or other variants from hugging face repo ) 
+  --output_dir /path/to/save_results
+```
+3. Inference - Generate transcriptions using the fine-tuned model.
+```bash
+python inference.py \
+  --dataset_dir /path/to/raw_dataset \
+  --orig_out_txt /path/to/save_references.txt \
+  --pred_out_txt /path/to/save_predictions.txt \
+  --model_path /path/to/checkpoint_dir \
+```
+4. Results - Compute WER and CER to assess model accuracy (and any other metric as required).
+```bash
+python results.py \
+        --original /path/to/test_orig.txt \
+        --predicted /path/to/test_predicted.txt
+```
